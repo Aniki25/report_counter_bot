@@ -1,6 +1,7 @@
 import logging
 import os
 import asyncio
+import threading
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -22,7 +23,7 @@ application = None
 counter = 0
 counter_lock = asyncio.Lock()
 
-# --- Обработчики команд ---
+# --- Обработчики команд (без изменений) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("Подписать отчет", callback_data='sign')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -60,6 +61,30 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current = counter
     await update.message.reply_text(f"Текущее значение счётчика: {current}")
 
+# --- Функция для запуска бота (будет выполнена в отдельном потоке) ---
+def run_bot():
+    """Запускает бота в новом событийном цикле asyncio."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Создаём приложение
+    app = Application.builder().token(TOKEN).build()
+    
+    # Добавляем обработчики
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CallbackQueryHandler(button_callback, pattern='sign'))
+    
+    # Запускаем бота
+    loop.run_until_complete(app.initialize())
+    loop.run_until_complete(app.start())
+    loop.run_until_complete(app.updater.start_polling())
+    logger.info("✅ Бот успешно запущен и слушает сообщения!")
+    
+    # Держим поток живым
+    loop.run_forever()
+
 # --- Flask приложение (для health checks) ---
 flask_app = Flask(__name__)
 
@@ -70,34 +95,15 @@ def health():
 
 @flask_app.route('/start-bot')
 def start_bot():
-    """Эндпоинт для запуска бота в фоне."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(run_bot())
-    return "Bot started", 200
+    """Эндпоинт для запуска бота в фоне (если вдруг не запустился автоматически)."""
+    if not any(isinstance(t, threading.Thread) and t.name == "BotThread" for t in threading.enumerate()):
+        thread = threading.Thread(target=run_bot, name="BotThread", daemon=True)
+        thread.start()
+        return "Bot started", 200
+    else:
+        return "Bot already running", 200
 
-# --- Запуск бота ---
-async def run_bot():
-    global application
-    application = Application.builder().token(TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("reset", reset))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CallbackQueryHandler(button_callback, pattern='sign'))
-
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    logger.info("Бот успешно запущен!")
-
-    # Бесконечное ожидание
-    while True:
-        await asyncio.sleep(3600)
-
-# Главная функция для gunicorn
-if __name__ != "__main__":
-    # При импорте этого файла (gunicorn это делает) запускаем бота в фоне
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(run_bot())
+# --- Автоматический запуск бота при старте gunicorn ---
+# Запускаем бота в фоновом потоке сразу при импорте модуля
+bot_thread = threading.Thread(target=run_bot, name="BotThread", daemon=True)
+bot_thread.start()
