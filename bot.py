@@ -1,9 +1,8 @@
-import logging
 import os
-from aiohttp import web
+import logging
+from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-import asyncio
 
 # Настройка логирования
 logging.basicConfig(
@@ -12,19 +11,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Токен из переменной окружения
+# Токен и URL вашего сервиса на Render
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-if not TOKEN:
-    raise ValueError("Переменная окружения TELEGRAM_TOKEN не установлена")
+RENDER_URL = os.environ.get("RENDER_URL")  # Например: https://your-service.onrender.com
 
-# Порт, который назначает Render
-PORT = int(os.environ.get("PORT", 10000))
+if not TOKEN or not RENDER_URL:
+    raise ValueError("TELEGRAM_TOKEN и RENDER_URL должны быть установлены")
 
-# Счётчик и блокировка
+# Создаём приложение Flask
+app = Flask(__name__)
+
+# Глобальные переменные
 counter = 0
-counter_lock = asyncio.Lock()
+counter_lock = None  # Блокировка не нужна для webhook, но оставим для порядка
 
-# --- Обработчики команд Telegram ---
+# Создаём Application один раз
+application = Application.builder().token(TOKEN).build()
+
+# --- Обработчики команд ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("Подписать отчет", callback_data='sign')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -34,76 +38,61 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global counter
     query = update.callback_query
     await query.answer()
 
-    global counter
-    async with counter_lock:
-        counter += 1
-        current = counter
+    counter += 1
+    current = counter
 
-        await query.message.reply_text(f"Подписан отчет №{current}")
+    await query.message.reply_text(f"Подписан отчет №{current}")
 
-        if current == 9:
-            await query.message.reply_text("Внимание! Следующий отчет пройдет экспертную проверку.")
-        elif current == 10:
-            await query.message.reply_text("Отчет отправлен на экспертную проверку!")
-            counter = 0
+    if current == 9:
+        await query.message.reply_text("Внимание! Следующий отчет пройдет экспертную проверку.")
+    elif current == 10:
+        await query.message.reply_text("Отчет отправлен на экспертную проверку!")
+        counter = 0
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global counter
-    async with counter_lock:
-        counter = 0
+    counter = 0
     await update.message.reply_text("Счётчик сброшен.")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global counter
-    async with counter_lock:
-        current = counter
-    await update.message.reply_text(f"Текущее значение счётчика: {current}")
+    await update.message.reply_text(f"Текущее значение счётчика: {counter}")
 
-# --- Запуск бота ---
-async def run_bot(app: Application):
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    logger.info("✅ Бот успешно запущен и слушает сообщения!")
+# Регистрируем обработчики
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("reset", reset))
+application.add_handler(CommandHandler("status", status))
+application.add_handler(CallbackQueryHandler(button_callback, pattern='sign'))
 
-# --- HTTP endpoints для Render (health checks) ---
-async def health(request):
-    return web.Response(text="OK")
+# --- Flask endpoint для приёма обновлений от Telegram ---
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    """Принимает POST-запросы от Telegram."""
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    asyncio.run(application.process_update(update))
+    return "OK", 200
 
-async def start_bot_handler(request):
-    # Просто подтверждаем, что бот работает (он уже запущен)
-    return web.Response(text="Bot is running")
+@app.route("/")
+def index():
+    return "Bot is running", 200
 
-# --- Главная функция ---
-async def main():
-    # Создаём приложение бота
-    application = Application.builder().token(TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("reset", reset))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CallbackQueryHandler(button_callback, pattern='sign'))
+# --- Установка вебхука при старте (один раз) ---
+def set_webhook():
+    """Устанавливает вебхук для бота."""
+    webhook_url = f"{RENDER_URL}/{TOKEN}"
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(application.bot.set_webhook(webhook_url))
+    logger.info(f"Вебхук установлен на {webhook_url}")
 
-    # Запускаем бота в фоновой задаче
-    asyncio.create_task(run_bot(application))
+# Вызываем установку вебхука при импорте модуля (только один раз при запуске)
+set_webhook()
 
-    # Создаём aiohttp приложение
-    web_app = web.Application()
-    web_app.router.add_get('/', health)
-    web_app.router.add_get('/health', health)
-    web_app.router.add_get('/start-bot', start_bot_handler)
-
-    # Запускаем HTTP сервер
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    logger.info(f"🌐 HTTP сервер запущен на порту {PORT}")
-
-    # Держим процесс активным
-    await asyncio.Event().wait()
-
-if __name__ == '__main__':
-    asyncio.run(main())
+# Это нужно для Flask, чтобы он мог запуститься
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
