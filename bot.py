@@ -3,6 +3,7 @@ import logging
 from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import asyncio
 
 # Настройка логирования
 logging.basicConfig(
@@ -21,11 +22,10 @@ if not TOKEN or not RENDER_URL:
 # Создаём приложение Flask
 app = Flask(__name__)
 
-# Глобальные переменные
+# Глобальный счётчик
 counter = 0
-counter_lock = None  # Блокировка не нужна для webhook, но оставим для порядка
 
-# Создаём Application один раз
+# Создаём Application
 application = Application.builder().token(TOKEN).build()
 
 # --- Обработчики команд ---
@@ -68,10 +68,20 @@ application.add_handler(CommandHandler("reset", reset))
 application.add_handler(CommandHandler("status", status))
 application.add_handler(CallbackQueryHandler(button_callback, pattern='sign'))
 
-# --- Flask endpoint для приёма обновлений от Telegram ---
+# --- Функция установки вебхука ---
+def set_webhook():
+    webhook_url = f"{RENDER_URL}/{TOKEN}"
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(application.bot.set_webhook(webhook_url))
+    logger.info(f"Вебхук установлен на {webhook_url}")
+
+# Устанавливаем вебхук при старте
+set_webhook()
+
+# --- Flask endpoint для приёма обновлений ---
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
-    """Принимает POST-запросы от Telegram."""
     update = Update.de_json(request.get_json(force=True), application.bot)
     asyncio.run(application.process_update(update))
     return "OK", 200
@@ -80,19 +90,7 @@ def webhook():
 def index():
     return "Bot is running", 200
 
-# --- Установка вебхука при старте (один раз) ---
-def set_webhook():
-    """Устанавливает вебхук для бота."""
-    webhook_url = f"{RENDER_URL}/{TOKEN}"
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(application.bot.set_webhook(webhook_url))
-    logger.info(f"Вебхук установлен на {webhook_url}")
-
-# Вызываем установку вебхука при импорте модуля (только один раз при запуске)
-set_webhook()
-
-# Это нужно для Flask, чтобы он мог запуститься
+# --- Запуск Flask (без gunicorn) ---
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
